@@ -1,501 +1,488 @@
-# راهنمای توسعه‌دهنده Business Audit در ArgessCloud API
+# راهنمای توسعه‌دهنده AFTA Business Audit — API یک‌خطی
 
-**نسخه:** Phase 37.4  
-**مخاطب:** برنامه‌نویسان ماژول‌های حسابداری، انبار، فروش، خزانه‌داری و سایر عملیات تجاری  
-**محل SDK:** `ArgessCloud.Api/Infrastructure/Afta`
+**نسخه:** Phase 37.5  
+**مخاطب:** برنامه‌نویسان API حسابداری، انبار، فروش، خزانه‌داری و سایر ماژول‌های تجاری  
+**Namespace:** `ArgessCloud.Api.Infrastructure.Afta`
 
 ---
 
 ## 1. هدف
 
-برای ثبت Audit عملیات تجاری، نباید در پروژه‌های `ArgessAcc.Model`، `ArgessAcc.DAL` و `ArgessAcc.BLL` تغییری ایجاد شود. برنامه‌نویس فقط در Action نهایی API و دقیقاً در نقطه‌ای که عملیات واقعی Insert، Update یا Delete انجام می‌شود، متد استاندارد AFTA را فراخوانی می‌کند.
+برای عملیات معمول روی یک رکورد، برنامه‌نویس فقط یکی از متدهای زیر را فراخوانی می‌کند:
 
-Framework به‌صورت مرکزی این موارد را مدیریت می‌کند:
+```csharp
+AftaAudit.Insert(...);
+AftaAudit.Update(...);
+AftaAudit.Delete(...);
+```
 
-- خواندن Feature Flag و Security Setting از Policy Cache مرکزی؛
+نسخه‌های Async نیز وجود دارند:
+
+```csharp
+await AftaAudit.InsertAsync(...);
+await AftaAudit.UpdateAsync(...);
+await AftaAudit.DeleteAsync(...);
+```
+
+Helper به‌صورت مرکزی این کارها را انجام می‌دهد:
+
+- خواندن Policy و Feature Flag از Cache مرکزی؛
 - تشخیص روشن یا خاموش بودن AFTA و Business Audit؛
-- تشخیص Business Database و ساخت نام دیتابیس AFTA با الگوی `BusinessDatabaseName + DatabaseSuffix`؛
-- دریافت User، Company، Financial Year، IP، UserAgent و اطلاعات Request؛
-- ایجاد Correlation ID؛
-- ثبت زمان اجرای عملیات و نتیجه موفق یا ناموفق؛
-- دریافت Snapshot قبل و بعد، فقط در صورت فعال بودن تنظیم مربوط؛
-- Mask کردن اطلاعات حساس Snapshot؛
-- ساخت SHA-256 برای کنترل تمامیت؛
-- ثبت Business Audit Log و Sensitive Action؛
-- جلوگیری از ثبت Audit تکراری توسط Audit Filter عمومی؛
-- Fail-open بودن Audit؛ یعنی خطای سامانه Audit نباید عملیات اصلی حسابداری یا تجاری را متوقف کند.
+- تشخیص Business Database از Context درخواست؛
+- ساخت دیتابیس AFTA با همان معماری موجود؛
+- خواندن امن Snapshot قبل و بعد از رکورد؛
+- حذف ستون‌های حساس، باینری و حجیم از Snapshot؛
+- دریافت User، Company، Financial Year، IP و UserAgent؛
+- ساخت Correlation ID و Hash؛
+- ثبت نتیجه موفق یا ناموفق؛
+- ثبت Sensitive Action در صورت فعال بودن؛
+- Fail-open بودن Audit؛
+- جلوگیری از Audit تکراری Filter عمومی.
 
-> برنامه‌نویس نباید مستقیماً جدول‌های AFTA، Stored Procedureهای Audit، Policy Provider یا ConnectionStringها را صدا بزند.
+> هیچ ConnectionString جدیدی ساخته نمی‌شود. Helper فقط از `SQLCONFIG` و `SQLCON` استفاده می‌کند.
 
 ---
 
-## 2. Namespaceهای لازم
+## 2. Namespace لازم
 
 ```csharp
 using ArgessCloud.Api.Infrastructure.Afta;
 ```
 
-برای Snapshotهای JSON معمولاً این Namespace نیز لازم است:
-
-```csharp
-using Newtonsoft.Json;
-```
-
 ---
 
-## 3. متدهای استاندارد SDK
+## 3. ساده‌ترین نمونه‌ها
 
-برای عملیات Sync:
-
-```csharp
-AftaBusinessAuditExecutor.ExecuteInsert(...);
-AftaBusinessAuditExecutor.ExecuteUpdate(...);
-AftaBusinessAuditExecutor.ExecuteDelete(...);
-```
-
-برای عملیات Async:
+### Insert با ID برگشتی
 
 ```csharp
-await AftaBusinessAuditExecutor.ExecuteInsertAsync(...);
-await AftaBusinessAuditExecutor.ExecuteUpdateAsync(...);
-await AftaBusinessAuditExecutor.ExecuteDeleteAsync(...);
-```
-
-هر متد در دو حالت قابل استفاده است:
-
-1. عملیات دارای مقدار بازگشتی، مانند شناسه رکورد Insert‌شده؛
-2. عملیات بدون مقدار بازگشتی، مانند یک متد `void` یا `Task`.
-
-متدهای عمومی `Execute` و `ExecuteAsync` برای عملیات خاص مانند Post، Confirm، Close یا Cancel وجود دارند؛ برای Insert/Update/Delete همیشه از متد نام‌دار همان عملیات استفاده شود.
-
----
-
-## 4. قرارداد اصلی استفاده
-
-ساختار صحیح همیشه به این صورت است:
-
-```csharp
-var command = new AftaBusinessAuditCommand
-{
-    OperationKey = "Module.Entity.Operation",
-    OperationTitle = "عنوان فارسی عملیات",
-    EntityType = "EntityName",
-    EntityId = entityId,
-    Reason = "علت انجام عملیات",
-    BeforeSnapshot = () => LoadBeforeSnapshot(),
-    AfterSnapshot = () => LoadAfterSnapshot()
-};
-
-AftaBusinessAuditExecutor.ExecuteUpdate(
+var customerId = AftaAudit.Insert(
     this,
-    command,
-    () => BusinessMethod());
+    "dbo.Customer",
+    "CustomerId",
+    () => CustomerData.Insert(model, CurrentDatabaseName));
 ```
 
-سه بخش اصلی عبارت‌اند از:
-
-- `this`: Controller فعلی API؛
-- `command`: مشخصات Audit؛
-- `action`: همان عملیات اصلی برنامه که باید اجرا شود.
-
-عملیات اصلی را بیرون Executor اجرا نکنید. در غیر این صورت مدت اجرا، نتیجه، خطا و Snapshotها با عملیات واقعی هم‌بسته نخواهند بود.
-
----
-
-## 5. نمونه کامل Insert با مقدار بازگشتی
+### Update
 
 ```csharp
-[HttpPost]
-[Route("insert")]
-public IHttpActionResult Insert(CustomerModel model)
-{
-    var command = new AftaBusinessAuditCommand
-    {
-        OperationKey = "Sales.Customer.Insert",
-        OperationTitle = "ثبت مشتری",
-        EntityType = "Customer",
-        Reason = "ثبت مشتری از API فروش",
-        RiskLevel = "Medium",
-        SensitiveLevel = 2,
-        IsSensitiveAction = true
-    };
-
-    var insertedId = AftaBusinessAuditExecutor.ExecuteInsert(
-        this,
-        command,
-        () =>
-        {
-            var id = CustomerData.Insert(model, CurrentDatabaseName);
-
-            command.EntityId = id.ToString();
-            command.AfterSnapshot = () => BuildCustomerAuditSnapshot(id);
-
-            return id;
-        });
-
-    return Ok(new ApiResult<long>
-    {
-        IsSuccess = true,
-        Message = "مشتری با موفقیت ثبت شد",
-        Data = insertedId
-    });
-}
-```
-
-نکات Insert:
-
-- قبل از Insert معمولاً `BeforeSnapshot` وجود ندارد.
-- بعد از دریافت ID، مقدار `command.EntityId` را تنظیم کنید.
-- `AfterSnapshot` را بعد از مشخص شدن ID تنظیم کنید تا Framework رکورد واقعی ثبت‌شده را بخواند.
-- اگر متد Insert مقدار برنمی‌گرداند، از overload بدون خروجی استفاده کنید.
-
----
-
-## 6. نمونه Insert بدون مقدار بازگشتی
-
-```csharp
-AftaBusinessAuditExecutor.ExecuteInsert(
+AftaAudit.Update(
     this,
-    new AftaBusinessAuditCommand
-    {
-        OperationKey = "Inventory.StockOpening.Insert",
-        OperationTitle = "ثبت موجودی اول دوره",
-        EntityType = "StockOpening",
-        EntityId = model.Id.ToString(),
-        Reason = "ثبت موجودی اول دوره انبار"
-    },
-    () => StockOpeningData.Insert(model, CurrentDatabaseName));
+    "dbo.Customer",
+    "CustomerId",
+    model.CustomerId,
+    () => CustomerData.Update(model, CurrentDatabaseName));
 ```
 
----
-
-## 7. نمونه کامل Update
+### Delete
 
 ```csharp
-[HttpPost]
-[Route("update")]
-public IHttpActionResult Update(CustomerModel model)
-{
-    var entityId = model.CustomerId.ToString();
-
-    AftaBusinessAuditExecutor.ExecuteUpdate(
-        this,
-        new AftaBusinessAuditCommand
-        {
-            OperationKey = "Sales.Customer.Update",
-            OperationTitle = "ویرایش مشتری",
-            EntityType = "Customer",
-            EntityId = entityId,
-            Reason = "ویرایش اطلاعات مشتری از API فروش",
-            RiskLevel = "Medium",
-            SensitiveLevel = 2,
-            IsSensitiveAction = true,
-            BeforeSnapshot = () => BuildCustomerAuditSnapshot(model.CustomerId),
-            AfterSnapshot = () => BuildCustomerAuditSnapshot(model.CustomerId)
-        },
-        () => CustomerData.Update(model, CurrentDatabaseName));
-
-    return Ok(new ApiResult<object>
-    {
-        IsSuccess = true,
-        Message = "مشتری با موفقیت ویرایش شد"
-    });
-}
+AftaAudit.Delete(
+    this,
+    "dbo.Customer",
+    "CustomerId",
+    customerId,
+    () => CustomerData.Delete(customerId, CurrentDatabaseName));
 ```
 
-ترتیب اجرا توسط Framework:
-
-1. Policy مرکزی بررسی می‌شود.
-2. در صورت فعال بودن Snapshot، `BeforeSnapshot` خوانده می‌شود.
-3. متد Update واقعی اجرا می‌شود.
-4. فقط پس از موفقیت، `AfterSnapshot` خوانده می‌شود.
-5. Audit موفق ثبت می‌شود.
-6. اگر Update Exception بدهد، Audit ناموفق ثبت و همان Exception دوباره پرتاب می‌شود.
+این سه نمونه برای عملیات معمول کافی‌اند. برنامه‌نویس Policy، دیتابیس AFTA، Snapshot، Hash یا Context را مستقیم مدیریت نمی‌کند.
 
 ---
 
-## 8. نمونه کامل Delete
-
-```csharp
-[HttpPost]
-[Route("delete")]
-public IHttpActionResult Delete(Guid id, Guid userId)
-{
-    AftaBusinessAuditExecutor.ExecuteDelete(
-        this,
-        new AftaBusinessAuditCommand
-        {
-            OperationKey = "Inventory.WarehouseReceipt.Delete",
-            OperationTitle = "حذف رسید انبار",
-            EntityType = "WarehouseReceipt",
-            EntityId = id.ToString(),
-            Reason = "حذف رسید انبار توسط کاربر",
-            RiskLevel = "High",
-            SensitiveLevel = 4,
-            IsSensitiveAction = true,
-            BeforeSnapshot = () => BuildReceiptAuditSnapshot(id),
-            AfterSnapshot = () => JsonConvert.SerializeObject(new
-            {
-                Deleted = true,
-                ReceiptId = id,
-                DeletedBy = userId
-            })
-        },
-        () => WarehouseReceiptData.Delete(id, userId, CurrentDatabaseName));
-
-    return Ok(new ApiResult<object>
-    {
-        IsSuccess = true,
-        Message = "رسید انبار با موفقیت حذف شد"
-    });
-}
-```
-
-برای Delete، SDK در صورت تعیین نشدن مقدار مناسب، سطح ریسک را `High` و `SensitiveLevel` را حداقل `3` در نظر می‌گیرد. بااین‌حال برای عملیات بسیار حساس، مقدار صریح مانند `4` یا `5` ثبت شود.
-
----
-
-## 9. نمونه Async
-
-```csharp
-[HttpPost]
-[Route("update-async")]
-public async Task<IHttpActionResult> UpdateAsync(CustomerModel model)
-{
-    await AftaBusinessAuditExecutor.ExecuteUpdateAsync(
-        this,
-        new AftaBusinessAuditCommand
-        {
-            OperationKey = "Sales.Customer.Update",
-            OperationTitle = "ویرایش مشتری",
-            EntityType = "Customer",
-            EntityId = model.CustomerId.ToString(),
-            Reason = "ویرایش Async مشتری",
-            BeforeSnapshot = () => BuildCustomerAuditSnapshot(model.CustomerId),
-            AfterSnapshot = () => BuildCustomerAuditSnapshot(model.CustomerId)
-        },
-        () => CustomerData.UpdateAsync(model, CurrentDatabaseName));
-
-    return Ok();
-}
-```
-
-Callbackهای Snapshot در نسخه فعلی Sync هستند. داخل آن‌ها Query کوتاه و مستقیم اجرا کنید و عملیات طولانی یا شبکه‌ای قرار ندهید.
-
----
-
-## 10. تعریف فیلدهای AftaBusinessAuditCommand
-
-| فیلد | اجباری | توضیح |
-|---|---:|---|
-| `OperationKey` | بله | کلید یکتا با الگوی `Module.Entity.Operation`؛ نمونه: `Accounting.Sanad.Update` |
-| `OperationTitle` | بله | عنوان فارسی قابل فهم برای مدیر و Auditor |
-| `EntityType` | بله | نام موجودیت تجاری؛ نمونه: `Sanad`، `Invoice`، `WarehouseReceipt` |
-| `EntityId` | توصیه‌شده | شناسه رکورد؛ در Insert می‌تواند پس از عملیات تنظیم شود |
-| `Reason` | برای عملیات حساس بله | دلیل تجاری یا منبع انجام عملیات؛ از متن آزاد کاربر بدون کنترل استفاده نشود |
-| `RiskLevel` | خیر | `Low`، `Medium`، `High` یا `Critical`؛ پیش‌فرض `Medium` |
-| `SensitiveLevel` | خیر | عدد 0 تا 5؛ پیش‌فرض 2؛ Delete حداقل 3 |
-| `IsSensitiveAction` | خیر | تعیین می‌کند رکورد Sensitive Action نیز ثبت شود؛ پیش‌فرض `true` |
-| `SkipAutomaticApiAudit` | خیر | مانع Audit تکراری Filter عمومی می‌شود؛ پیش‌فرض `true` و معمولاً تغییر نکند |
-| `BeforeSnapshot` | خیر | تابعی برای خواندن وضعیت قبل از عملیات |
-| `AfterSnapshot` | خیر | تابعی برای خواندن وضعیت بعد از عملیات |
-| `AfterSnapshotFromResult` | خیر | ساخت Snapshot بعد از عملیات با استفاده از نتیجه برگشتی |
-| `SuccessStatusCode` | خیر | Status Code موفق ثبت‌شده در Audit؛ پیش‌فرض `200 OK` |
-
----
-
-## 11. استاندارد OperationKey
-
-فرمت ثابت:
-
-```text
-Module.Entity.Operation
-```
-
-نمونه‌ها:
-
-```text
-Accounting.Sanad.Insert
-Accounting.Sanad.Update
-Accounting.Sanad.Delete
-Inventory.WarehouseReceipt.Insert
-Sales.Invoice.Confirm
-Treasury.Payment.Cancel
-```
-
-قواعد:
-
-- فقط نام فنی پایدار و انگلیسی استفاده شود.
-- نام Controller یا Route متغیر را به‌عنوان کلید قرار ندهید.
-- برای یک عملیات واحد، در نقاط مختلف برنامه کلیدهای متفاوت نسازید.
-- تغییر عنوان فارسی مجاز است؛ تغییر بی‌دلیل OperationKey باعث شکستن گزارش‌های تاریخی می‌شود.
-
----
-
-## 12. ساخت Snapshot امن
-
-Snapshot باید کوچک، قابل فهم و محدود به اطلاعات لازم Audit باشد.
-
-```csharp
-private string BuildCustomerAuditSnapshot(long customerId)
-{
-    var customer = CustomerData.Select(customerId, CurrentDatabaseName);
-    if (customer == null)
-    {
-        return null;
-    }
-
-    return JsonConvert.SerializeObject(new
-    {
-        customer.CustomerId,
-        customer.Code,
-        customer.Title,
-        customer.IsActive,
-        customer.ModifiedDate
-    });
-}
-```
-
-موارد ممنوع در Snapshot:
-
-- Password، Token، Cookie، ConnectionString و Secret؛
-- اطلاعات کامل کارت بانکی یا داده‌های محرمانه غیرضروری؛
-- فایل، تصویر یا Base64؛
-- لیست‌های بسیار بزرگ؛
-- کل Request یا کل Model بدون انتخاب فیلدهای لازم؛
-- داده‌ای که بازیابی آن Query بسیار سنگین دارد.
-
-Framework متن Snapshot را Mask می‌کند، اما این قابلیت جایگزین انتخاب صحیح داده توسط برنامه‌نویس نیست.
-
-### Snapshot و Diff
-
-Framework وضعیت قبل و بعد را در یک Correlation واحد ثبت می‌کند؛ بنابراین تغییرات از مقایسه `BeforeSnapshot` و `AfterSnapshot` قابل استخراج است. در نسخه فعلی، Diff ساخت‌یافته و فیلدبه‌فیلد در ستون مستقل ذخیره نمی‌شود. برای حفظ پایداری و جلوگیری از تغییر Schema در Phase 37.4، منبع معتبر تغییر همان زوج Snapshot و Hashهای آن‌ها است.
-
----
-
-## 13. رفتار Performance و Zero-cost
-
-وقتی AFTA یا Business Audit خاموش باشد:
-
-- فقط Policy Snapshot از Cache مرکزی خوانده می‌شود؛
-- Snapshotهای Before/After اجرا نمی‌شوند؛
-- SHA-256 ساخته نمی‌شود؛
-- اتصال یا Write به دیتابیس AFTA انجام نمی‌شود؛
-- فقط عملیات اصلی برنامه اجرا می‌شود.
-
-وقتی Audit روشن ولی `Audit.RecordMutationSnapshots=false` باشد:
-
-- عملیات و Audit پایه ثبت می‌شوند؛
-- Callbackهای Snapshot اجرا نمی‌شوند؛
-- هزینه Queryهای Before/After حذف می‌شود.
-
-برنامه‌نویس نباید قبل از ورود به Executor، Snapshot را محاسبه کند. این اشتباه باعث می‌شود حتی در حالت خاموش بودن Audit نیز هزینه Query پرداخت شود.
+## 4. چرا عملیات اصلی داخل Helper قرار می‌گیرد؟
 
 اشتباه:
 
 ```csharp
-var before = BuildSnapshot(id);
-command.BeforeSnapshot = () => before;
+CustomerData.Update(model, CurrentDatabaseName);
+AftaAudit.Update(...);
 ```
+
+در این حالت وضعیت قبل از تغییر، زمان اجرای واقعی و Exception عملیات در اختیار Framework نیست.
 
 صحیح:
 
 ```csharp
-command.BeforeSnapshot = () => BuildSnapshot(id);
+AftaAudit.Update(
+    this,
+    "dbo.Customer",
+    "CustomerId",
+    model.CustomerId,
+    () => CustomerData.Update(model, CurrentDatabaseName));
+```
+
+Helper قبل از اجرای Delegate، Snapshot قبلی را می‌خواند؛ سپس عملیات اصلی را اجرا می‌کند و بعد Snapshot جدید را ثبت می‌کند.
+
+---
+
+## 5. Insert
+
+### 5.1 Insert با شناسه برگشتی
+
+برای متدهایی که ID جدید را برمی‌گردانند:
+
+```csharp
+var id = AftaAudit.Insert(
+    this,
+    "sales.Customer",
+    "CustomerId",
+    () => CustomerData.Insert(model, CurrentDatabaseName));
+```
+
+مقدار برگشتی Delegate به‌عنوان شناسه رکورد استفاده می‌شود و Snapshot بعد از Insert از همان رکورد خوانده می‌شود.
+
+نوع ID می‌تواند `int`، `long`، `Guid`، `string` یا سایر نوع‌های قابل ارسال به SQL Server باشد.
+
+### 5.2 Insert با شناسه از قبل مشخص
+
+برای Guid یا کلیدی که قبل از Insert ساخته شده است:
+
+```csharp
+var id = Guid.NewGuid();
+
+AftaAudit.Insert(
+    this,
+    "dbo.Project",
+    "ProjectId",
+    id,
+    () => ProjectData.Insert(id, model, CurrentDatabaseName));
+```
+
+### 5.3 Insert بدون مقدار برگشتی
+
+اگر متد اصلی `void` است ولی ID از قبل مشخص است، از همان overload بالا استفاده کنید.
+
+---
+
+## 6. Update
+
+```csharp
+AftaAudit.Update(
+    this,
+    "inventory.WarehouseReceipt",
+    "ReceiptId",
+    model.ReceiptId,
+    () => WarehouseReceiptData.Update(model, CurrentDatabaseName));
+```
+
+ترتیب داخلی:
+
+1. Policy مرکزی بررسی می‌شود.
+2. فقط در صورت فعال بودن Snapshot، وضعیت قبل خوانده می‌شود.
+3. Update اصلی اجرا می‌شود.
+4. فقط در صورت موفقیت، وضعیت بعد خوانده می‌شود.
+5. Audit موفق ثبت می‌شود.
+6. در صورت Exception، Audit ناموفق ثبت و همان Exception دوباره پرتاب می‌شود.
+
+### Update دارای مقدار برگشتی
+
+```csharp
+var affectedRows = AftaAudit.Update(
+    this,
+    "dbo.Customer",
+    "CustomerId",
+    model.CustomerId,
+    () => CustomerData.UpdateAndReturnAffectedRows(model, CurrentDatabaseName));
+```
+
+مقدار برگشتی بدون تغییر به Controller بازگردانده می‌شود.
+
+---
+
+## 7. Delete
+
+```csharp
+AftaAudit.Delete(
+    this,
+    "inventory.WarehouseReceipt",
+    "ReceiptId",
+    receiptId,
+    () => WarehouseReceiptData.Delete(receiptId, CurrentDatabaseName));
+```
+
+در Delete:
+
+- Snapshot قبل از حذف خوانده می‌شود؛
+- عملیات حذف اجرا می‌شود؛
+- پس از موفقیت، Marker حذف شامل نام جدول، ستون کلید و ID ثبت می‌شود؛
+- ریسک پیش‌فرض `High` و Sensitive Level پیش‌فرض `3` است.
+
+### Delete دارای مقدار برگشتی
+
+```csharp
+var deletedCount = AftaAudit.Delete(
+    this,
+    "dbo.Customer",
+    "CustomerId",
+    customerId,
+    () => CustomerData.DeleteAndReturnCount(customerId, CurrentDatabaseName));
 ```
 
 ---
 
-## 14. مدیریت خطا
+## 8. نسخه‌های Async
 
-Framework دو اصل دارد:
-
-1. Exception عملیات اصلی مخفی نمی‌شود و پس از ثبت Audit ناموفق دوباره پرتاب می‌شود.
-2. Exception داخلی Audit، Policy یا دیتابیس AFTA عملیات اصلی را متوقف نمی‌کند.
-
-بنابراین Controller همچنان باید Validation و Exception handling معمول برنامه را حفظ کند. Executor جایگزین Validation، Transaction یا Business Rule نیست.
-
-اگر عملیات اصلی داخل Transaction انجام می‌شود، کل Commit واقعی را داخل `action` قرار دهید. Audit باید فقط پس از موفقیت متد اصلی، نتیجه موفق ثبت کند.
-
----
-
-## 15. مواردی که نباید انجام شود
-
-- تغییر مستقیم `ArgessAcc.Model`، `ArgessAcc.DAL` یا `ArgessAcc.BLL` برای Audit؛
-- استفاده از Trigger عمومی دیتابیس؛
-- استفاده از ActionFilter عمومی برای Snapshot عملیات تجاری؛
-- فراخوانی مستقیم `BusinessAftaServiceFactory` از Controllerهای تجاری؛
-- خواندن مستقیم Feature Flag یا Security Setting در Controller؛
-- ساخت ConnectionString سوم برای AFTA؛
-- ثبت Audit قبل از موفقیت عملیات؛
-- اجرای عملیات اصلی بیرون Executor؛
-- استفاده از یک Snapshot سنگین برای کل Aggregate؛
-- بلعیدن Exception عملیات اصلی؛
-- ثبت اطلاعات حساس خام در `Reason` یا Snapshot.
-
----
-
-## 16. Checklist قبل از Commit
-
-- [ ] عملیات واقعی داخل یکی از متدهای `ExecuteInsert/Update/Delete` قرار دارد.
-- [ ] `OperationKey` از الگوی ثابت پیروی می‌کند.
-- [ ] `OperationTitle` فارسی و قابل فهم است.
-- [ ] `EntityType` و در صورت امکان `EntityId` ثبت شده‌اند.
-- [ ] برای Update و Delete، Snapshot قبل از عملیات تعریف شده است.
-- [ ] Snapshot بعد از موفقیت عملیات خوانده می‌شود.
-- [ ] Snapshot کوچک و فاقد Secret است.
-- [ ] برای عملیات حساس، `Reason`، `RiskLevel` و `SensitiveLevel` مناسب تعیین شده‌اند.
-- [ ] عملیات Cancel‌شده یا Validation ناموفق وارد Executor نمی‌شود.
-- [ ] Controller مستقیماً Policy، Cache یا دیتابیس AFTA را صدا نمی‌زند.
-- [ ] پروژه‌های `ArgessAcc.*` تغییر نکرده‌اند.
-- [ ] حالت Audit روشن و خاموش هر دو تست شده‌اند.
-- [ ] در صورت Exception عملیات اصلی، همان Exception به لایه بالاتر می‌رسد.
-
----
-
-## 17. الگوی آماده برای Copy/Paste
+### Insert Async
 
 ```csharp
-var command = new AftaBusinessAuditCommand
-{
-    OperationKey = "Module.Entity.Update",
-    OperationTitle = "ویرایش موجودیت",
-    EntityType = "Entity",
-    EntityId = id.ToString(),
-    Reason = "ویرایش موجودیت از API",
-    RiskLevel = "Medium",
-    SensitiveLevel = 2,
-    IsSensitiveAction = true,
-    BeforeSnapshot = () => BuildAuditSnapshot(id),
-    AfterSnapshot = () => BuildAuditSnapshot(id)
-};
-
-AftaBusinessAuditExecutor.ExecuteUpdate(
+var id = await AftaAudit.InsertAsync(
     this,
-    command,
+    "dbo.Customer",
+    "CustomerId",
+    () => CustomerData.InsertAsync(model, CurrentDatabaseName));
+```
+
+### Update Async
+
+```csharp
+await AftaAudit.UpdateAsync(
+    this,
+    "dbo.Customer",
+    "CustomerId",
+    model.CustomerId,
+    () => CustomerData.UpdateAsync(model, CurrentDatabaseName));
+```
+
+### Delete Async
+
+```csharp
+await AftaAudit.DeleteAsync(
+    this,
+    "dbo.Customer",
+    "CustomerId",
+    customerId,
+    () => CustomerData.DeleteAsync(customerId, CurrentDatabaseName));
+```
+
+---
+
+## 9. تنظیمات اختیاری
+
+برای عملیات معمول نیازی به ساخت Options نیست. در موارد حساس یا خاص:
+
+```csharp
+AftaAudit.Update(
+    this,
+    "dbo.Customer",
+    "CustomerId",
+    model.CustomerId,
+    () => CustomerData.Update(model, CurrentDatabaseName),
+    new AftaAuditOptions
+    {
+        OperationKey = "Sales.Customer.Update",
+        OperationTitle = "ویرایش مشتری",
+        EntityType = "Customer",
+        Reason = model.ChangeReason,
+        RiskLevel = "Medium",
+        SensitiveLevel = 2,
+        IsSensitiveAction = true,
+        ExcludedColumns = new[] { "ProfileImage", "InternalLargeText" }
+    });
+```
+
+### فیلدهای AftaAuditOptions
+
+| فیلد | کاربرد |
+|---|---|
+| `OperationKey` | کلید پایدار گزارش با الگوی `Module.Entity.Operation` |
+| `OperationTitle` | عنوان فارسی قابل فهم |
+| `EntityType` | نام موجودیت؛ در صورت عدم تعیین از نام جدول ساخته می‌شود |
+| `Reason` | دلیل تجاری عملیات |
+| `RiskLevel` | `Low`، `Medium`، `High` یا `Critical` |
+| `SensitiveLevel` | عدد 0 تا 5 |
+| `IsSensitiveAction` | ثبت یا عدم ثبت Sensitive Action |
+| `SkipAutomaticApiAudit` | جلوگیری از Audit تکراری؛ معمولاً تغییر نکند |
+| `ExcludedColumns` | ستون‌های اضافه‌ای که نباید وارد Snapshot شوند |
+| `MaxColumns` | حداکثر تعداد ستون‌ها؛ پیش‌فرض 128 |
+| `MaxValueLength` | حداکثر طول هر متن؛ پیش‌فرض 4000 |
+| `RecordDeleteMarker` | ثبت Marker بعد از Delete؛ پیش‌فرض true |
+
+---
+
+## 10. رفتار Snapshot Reader
+
+Helper نام جدول را به یکی از شکل‌های زیر می‌پذیرد:
+
+```text
+Customer
+dbo.Customer
+sales.Invoice
+```
+
+در صورت حذف Schema، مقدار `dbo` استفاده می‌شود.
+
+قواعد امنیتی:
+
+- نام Schema، جدول و ستون فقط از حروف، عدد و `_` تشکیل می‌شود؛
+- نام باید با حرف یا `_` شروع شود؛
+- مقدار ID همیشه SQL Parameter است؛
+- جدول و ستون با Metadata واقعی دیتابیس کنترل می‌شوند؛
+- نام جدول نباید از ورودی مستقیم کاربر گرفته شود؛
+- فقط Business Database موجود در Context باز می‌شود؛
+- Helper اجازه دریافت DatabaseName جداگانه ندارد.
+
+### ستون‌های حذف‌شده به‌صورت پیش‌فرض
+
+ستون‌هایی با نام یا مفهوم زیر وارد Snapshot نمی‌شوند:
+
+- Password و PasswordHash؛
+- Token و RefreshToken؛
+- Secret، PrivateKey و ApiKey؛
+- ConnectionString و Cookie؛
+- اطلاعات حساس کارت؛
+- انواع `binary`، `varbinary` و `image`؛
+- `xml`، `text` و `ntext`؛
+- ستون‌های `max` یا بسیار حجیم.
+
+Masking مرکزی AFTA نیز بعد از خواندن Snapshot همچنان اجرا می‌شود.
+
+---
+
+## 11. Performance و حالت خاموش
+
+وقتی AFTA یا Business Audit خاموش باشد:
+
+- فقط Snapshot Policy از Cache مرکزی خوانده می‌شود؛
+- هیچ Query برای Before/After اجرا نمی‌شود؛
+- هیچ Hash ساخته نمی‌شود؛
+- هیچ Write به دیتابیس AFTA انجام نمی‌شود؛
+- فقط Delegate اصلی اجرا می‌شود.
+
+وقتی Audit روشن ولی ثبت Snapshot خاموش باشد، عملیات Audit پایه ثبت می‌شود اما Queryهای رکورد اجرا نمی‌شوند.
+
+---
+
+## 12. Transaction
+
+اگر عملیات اصلی Transaction داخلی دارد، کل عملیات و Commit داخل Delegate باشد:
+
+```csharp
+AftaAudit.Update(
+    this,
+    "dbo.Invoice",
+    "InvoiceId",
+    invoiceId,
+    () => InvoiceService.UpdateWithTransaction(model, CurrentDatabaseName));
+```
+
+Audit موفق فقط بعد از بازگشت موفق Delegate ثبت می‌شود.
+
+Executor جایگزین Transaction، Validation یا Business Rule نیست.
+
+---
+
+## 13. عملیات پیچیده
+
+Helper یک‌خطی برای عملیات معمول روی یک رکورد طراحی شده است. در این موارد از `AftaBusinessAuditExecutor` کامل استفاده کنید:
+
+- کلید مرکب؛
+- عملیات روی چند جدول؛
+- Header/Detail یا Aggregate پیچیده؛
+- عملیات Batch؛
+- Post، Confirm، Close، Cancel یا Restore؛
+- Snapshot سفارشی؛
+- عملیات بدون یک رکورد مشخص.
+
+نمونه مسیر پیشرفته:
+
+```csharp
+AftaBusinessAuditExecutor.ExecuteUpdate(this, command, () => ComplexBusinessOperation());
+```
+
+---
+
+## 14. موارد ممنوع
+
+- تغییر `ArgessAcc.Model`، `ArgessAcc.DAL` یا `ArgessAcc.BLL`؛
+- ارسال DatabaseName به Helper؛
+- گرفتن نام جدول یا ستون از Request کاربر؛
+- فراخوانی مستقیم جدول‌ها یا Stored Procedureهای AFTA؛
+- ساخت ConnectionString سوم؛
+- اجرای عملیات اصلی قبل یا بعد از Helper؛
+- Trigger عمومی برای Business Audit؛
+- ActionFilter عمومی برای Snapshot تجاری؛
+- Snapshot دستی برای عملیات معمول یک‌جدولی؛
+- بلعیدن Exception عملیات اصلی.
+
+---
+
+## 15. Checklist برنامه‌نویس
+
+- [ ] عملیات اصلی داخل `AftaAudit.Insert/Update/Delete` قرار دارد.
+- [ ] نام جدول واقعی و دارای Schema صحیح است.
+- [ ] نام ستون کلید واقعی است.
+- [ ] مقدار ID مربوط به همان رکورد است.
+- [ ] نام جدول و ستون ثابت کد هستند و از Request نمی‌آیند.
+- [ ] برای عملیات حساس، Options مناسب ثبت شده است.
+- [ ] ستون‌های حجیم یا محرمانه اختصاصی در `ExcludedColumns` آمده‌اند.
+- [ ] Validation ناموفق قبل از ورود به Helper متوقف می‌شود.
+- [ ] حالت Audit روشن و خاموش تست شده است.
+- [ ] پروژه‌های `ArgessAcc.*` تغییر نکرده‌اند.
+
+---
+
+## 16. الگوهای آماده Copy/Paste
+
+### Insert
+
+```csharp
+var id = AftaAudit.Insert(
+    this,
+    "dbo.EntityTable",
+    "EntityId",
+    () => EntityData.Insert(model, CurrentDatabaseName));
+```
+
+### Update
+
+```csharp
+AftaAudit.Update(
+    this,
+    "dbo.EntityTable",
+    "EntityId",
+    model.EntityId,
     () => EntityData.Update(model, CurrentDatabaseName));
 ```
 
----
+### Delete
 
-## 18. مسیر نمونه واقعی در پروژه
-
-نمونه عملی Insert، Update و Delete سند حسابداری در فایل زیر موجود است:
-
-```text
-ArgessCloud.Api/Controllers/ArgessAccControllers/SanadController.cs
+```csharp
+AftaAudit.Delete(
+    this,
+    "dbo.EntityTable",
+    "EntityId",
+    entityId,
+    () => EntityData.Delete(entityId, CurrentDatabaseName));
 ```
 
-این فایل فقط نمونه مصرف SDK است. توسعه Audit برای سایر ماژول‌ها باید در Controllerهای API همان ماژول و بدون دستکاری پروژه‌های `ArgessAcc.*` انجام شود.
+### Update حساس
+
+```csharp
+AftaAudit.Update(
+    this,
+    "treasury.BankAccount",
+    "BankAccountId",
+    model.BankAccountId,
+    () => BankAccountData.Update(model, CurrentDatabaseName),
+    new AftaAuditOptions
+    {
+        OperationKey = "Treasury.BankAccount.Update",
+        OperationTitle = "ویرایش حساب بانکی",
+        Reason = model.ChangeReason,
+        RiskLevel = "High",
+        SensitiveLevel = 4,
+        ExcludedColumns = new[] { "EncryptedAccountData" }
+    });
+```
 
 ---
 
-## 19. جمع‌بندی معماری
-
-مسیر استاندارد نهایی:
+## 17. جمع‌بندی معماری
 
 ```text
 Business API Controller
+        ↓
+AftaAudit.Insert / Update / Delete
         ↓
 AftaBusinessAuditExecutor
         ↓
@@ -503,10 +490,7 @@ Central AftaPolicyProvider / Policy Cache
         ↓
 BusinessAftaServiceFactory
         ↓
-BusinessDatabaseName + AFTA Suffix
-        ↓
 Business Audit Log / Sensitive Action
 ```
 
-تنها مسئولیت برنامه‌نویس ماژول تجاری این است که عملیات اصلی، مشخصات Operation و Snapshotهای کوچک و امن را به Executor بدهد. تمام تصمیم‌گیری‌های Policy، Context، Correlation، Masking، Hash، ثبت موفق/ناموفق و Fail-open داخل Framework انجام می‌شود.
-
+برای عملیات معمول، مسئولیت برنامه‌نویس فقط معرفی جدول، ستون کلید، ID و Delegate عملیات اصلی است. تمام Policy checkها، Context، Snapshot، Masking، Hash، Correlation، ثبت موفق/ناموفق و Fail-open داخل Framework باقی می‌ماند.
